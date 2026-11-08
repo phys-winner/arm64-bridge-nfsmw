@@ -1,0 +1,40 @@
+diff --git a/include/oaknut/impl/offset.hpp b/include/oaknut/impl/offset.hpp
+index a70941f..4b729ca 100644
+--- a/include/oaknut/impl/offset.hpp
++++ b/include/oaknut/impl/offset.hpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: MIT
+ 
+ #pragma once
++#include <android/log.h>
++#include <cstdio>
+ 
+ #include <cstddef>
+ #include <cstdint>
+@@ -52,8 +54,11 @@ struct AddrOffset {
+     static std::uint32_t encode(std::ptrdiff_t diff)
+     {
+         const std::uint64_t diff_u64 = static_cast<std::uint64_t>(diff);
+-        if (detail::sign_extend<bitsize>(diff_u64) != diff_u64)
++        if (detail::sign_extend<bitsize>(diff_u64) != diff_u64) {
++            __android_log_print(ANDROID_LOG_ERROR, "oaknut",
++                                "AddrOffset OOR bits=%zu diff=%lld", bitsize, (long long)diff);
+             throw OaknutException{ExceptionType::OffsetOutOfRange};
++        }
+         if (diff_u64 != (diff_u64 & detail::inverse_mask_from_size(alignment)))
+             throw OaknutException{ExceptionType::OffsetMisaligned};
+ 
+@@ -79,8 +84,12 @@ struct PageOffset {
+     static std::uint32_t encode(std::uintptr_t current_addr, std::uintptr_t target)
+     {
+         std::uint64_t diff = static_cast<std::uint64_t>((static_cast<std::int64_t>(target) >> shift_amount) - (static_cast<std::int64_t>(current_addr) >> shift_amount));
+-        if (detail::sign_extend<bitsize>(diff) != diff)
++        if (detail::sign_extend<bitsize>(diff) != diff) {
++            __android_log_print(ANDROID_LOG_ERROR, "oaknut",
++                                "PageOffset OOR shift=%zu cur=%lx tgt=%lx", shift_amount,
++                                (unsigned long)current_addr, (unsigned long)target);
+             throw OaknutException{ExceptionType::OffsetOutOfRange};
++        }
+         diff &= detail::mask_from_size(bitsize);
+         return static_cast<std::uint32_t>(((diff & 3) << (bitsize - 2)) | (diff >> 2));
+     }

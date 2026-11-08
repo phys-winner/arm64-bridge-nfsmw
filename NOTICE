@@ -1,0 +1,19 @@
+Original bridge and port support code in this repository is licensed under
+the GNU General Public License, version 3 or (at your option) any later version
+(SPDX-License-Identifier: GPL-3.0-or-later). See LICENSE for the complete terms.
+
+The dependency patches modify third-party code. Upstream copyright notices
+and licenses continue to apply to that code and must be preserved:
+
+- Dynarmic: Copyright (C) 2017 merryhime; ISC license.
+  https://github.com/azahar-emu/dynarmic/blob/e77b1ba0b7da7cbe93021b01a663acfe7c4dd516/LICENSE.txt
+- Oaknut: Copyright (c) 2022 merryhime; MIT license; see the license in Dynarmic's externals/oaknut checkout.
+- Boost: Boost Software License 1.0.
+  https://www.boost.org/LICENSE_1_0.txt
+- Other transitive dependencies retain their upstream licenses. Their sources
+  and notices are obtained with Dynarmic, outside this repository's tracked tree.
+
+Need for Speed, Most Wanted, Electronic Arts, and related names belong to their
+respective owners. This is an independent preservation project and is not
+affiliated with or endorsed by Electronic Arts. The GPL grant covers this
+project's code, not the original game or third-party proprietary components.

@@ -1,0 +1,1660 @@
+diff --git a/src/dynarmic/backend/arm64/a32_address_space.cpp b/src/dynarmic/backend/arm64/a32_address_space.cpp
+index bbdf925f..aa997970 100644
+--- a/src/dynarmic/backend/arm64/a32_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a32_address_space.cpp
+@@ -306,7 +306,7 @@ void A32AddressSpace::EmitPrelude() {
+ 
+     prelude_info.return_to_dispatcher = code.xptr<void*>();
+     {
+-        oaknut::Label l_this, l_addr;
++        oaknut::Label l_this, l_addr, l_table, l_slow, l_cleared, l_no_clear;
+ 
+         code.LDAR(Wscratch0, Xhalt);
+         code.CBNZ(Wscratch0, return_from_run_code);
+@@ -316,14 +316,47 @@ void A32AddressSpace::EmitPrelude() {
+             code.B(LE, return_from_run_code);
+         }
+ 
++        // Bridge fast dispatch: X0 = location descriptor (regs[15] | upper_location_descriptor << 32), probe the
++        // direct-mapped table at FastDispatchIndex(X0) and branch to its code on an exact match.
++        static_assert(offsetof(A32JitState, regs) + 16 * sizeof(u32) == offsetof(A32JitState, upper_location_descriptor));
++        static_assert(sizeof(FastDispatchEntry) == 16);
++        code.LDUR(X0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++        code.LSR(X1, X0, 32);
++        code.EOR(W1, W1, W0, oaknut::LogShift::LSR, 1);
++        code.EOR(W1, W1, W0, oaknut::LogShift::LSR, 13);
++        code.AND(W1, W1, static_cast<u32>(FastDispatchCount - 1));
++        code.LDR(X2, l_table);
++        code.ADD(X2, X2, X1, oaknut::AddSubShift::LSL, 4);
++        code.LDP(X3, X4, X2);
++        code.CMP(X3, X0);
++        code.B(NE, l_slow);
++        code.BR(X4);
++
++        code.l(l_slow);
+         code.LDR(X0, l_this);
+         code.MOV(X1, Xstate);
+         code.LDR(Xscratch0, l_addr);
+         code.BLR(Xscratch0);
++        // Bridge (stage 14): GetOrEmit cleared the whole cache (bridge_cache_cleared): the return stack buffer
++        // entries pushed earlier in this run hold code pointers into the old cache contents.
++        code.LDR(Xscratch1, l_cleared);
++        code.LDR(Wscratch0, Xscratch1);
++        code.CBZ(Wscratch0, l_no_clear);
++        code.STR(WZR, Xscratch1);
++        if (conf.HasOptimization(OptimizationFlag::ReturnStackBuffer)) {
++            code.LDR(Xscratch0, l_return_to_dispatcher);
++            for (size_t i = 0; i < RSBCount; i++) {
++                code.STR(Xscratch0, SP, offsetof(StackLayout, rsb) + offsetof(RSBEntry, code_ptr) + i * sizeof(RSBEntry));
++            }
++        }
++        code.l(l_no_clear);
+         code.BR(X0);
+ 
+         const auto fn = [](A32AddressSpace& self, A32JitState& context) -> CodePtr {
+-            return self.GetOrEmit(context.GetLocationDescriptor());
++            const IR::LocationDescriptor location = context.GetLocationDescriptor();
++            const CodePtr entry = self.GetOrEmit(location);
++            self.FastDispatchStore(location.Value(), entry);
++            return entry;
+         };
+ 
+         code.align(8);
+@@ -331,6 +364,10 @@ void A32AddressSpace::EmitPrelude() {
+         code.dx(mcl::bit_cast<u64>(this));
+         code.l(l_addr);
+         code.dx(mcl::bit_cast<u64>(Common::FptrCast(fn)));
++        code.l(l_table);
++        code.dx(mcl::bit_cast<u64>(fast_dispatch.get()));
++        code.l(l_cleared);
++        code.dx(mcl::bit_cast<u64>(&bridge_cache_cleared));
+     }
+ 
+     prelude_info.return_from_run_code = code.xptr<void*>();
+@@ -367,6 +404,7 @@ void A32AddressSpace::EmitPrelude() {
+ }
+ 
+ EmitConfig A32AddressSpace::GetEmitConfig() {
++    static_assert(FastDispatchCount == 0x1000, "EmitInlineFastDispatch (emit_arm64_a32.cpp) masks the index with 0xfff");
+     return EmitConfig{
+         .optimizations = conf.unsafe_optimizations ? conf.optimizations : conf.optimizations & all_safe_optimizations,
+ 
+@@ -407,6 +445,9 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
+         .state_nzcv_offset = offsetof(A32JitState, cpsr_nzcv),
+         .state_fpsr_offset = offsetof(A32JitState, fpsr),
+         .state_exclusive_state_offset = offsetof(A32JitState, exclusive_state),
++        .state_exclusive_address_offset = offsetof(A32JitState, exclusive_address),
++        .state_exclusive_value_offset = offsetof(A32JitState, exclusive_value),
++        .fast_dispatch_table = fast_dispatch.get(),
+ 
+         .coprocessors = conf.coprocessors,
+ 
+diff --git a/src/dynarmic/backend/arm64/a32_interface.cpp b/src/dynarmic/backend/arm64/a32_interface.cpp
+index 6b38c410..b311fbdc 100644
+--- a/src/dynarmic/backend/arm64/a32_interface.cpp
++++ b/src/dynarmic/backend/arm64/a32_interface.cpp
+@@ -15,6 +15,7 @@
+ #include "dynarmic/backend/arm64/a32_core.h"
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
+ #include "dynarmic/common/atomic.h"
++#include "dynarmic/frontend/A32/a32_location_descriptor.h"
+ #include "dynarmic/interface/A32/a32.h"
+ 
+ namespace Dynarmic::A32 {
+@@ -76,6 +77,31 @@ struct Jit::Impl final {
+         current_state = {};
+     }
+ 
++    std::size_t PrecompileBlocks(const std::uint64_t* descriptors, std::size_t count, std::size_t min_remaining_bytes) {
++        ASSERT(!jit_interface->is_executing);
++        PerformRequestedCacheInvalidation(static_cast<HaltReason>(Atomic::Load(&halt_reason)));
++        return current_address_space.BridgePrecompile(descriptors, count, min_remaining_bytes);
++    }
++
++    bool ReverseLookupDescriptor(const void* host_pc, std::uint64_t* descriptor) {
++        return current_address_space.BridgeReverseLookup(host_pc, descriptor) == 1;
++    }
++
++    bool BlockCode(std::uint64_t descriptor, const void** code, std::size_t* size) {
++        return current_address_space.BridgeBlockCode(descriptor, code, size);
++    }
++
++    int ReverseLookup(const void* host_pc, std::uint32_t* guest_pc, bool* thumb) {
++        std::uint64_t descriptor = 0;
++        const int kind = current_address_space.BridgeReverseLookup(host_pc, &descriptor);
++        if (kind == 1) {
++            const A32::LocationDescriptor location{IR::LocationDescriptor{descriptor}};
++            *guest_pc = location.PC();
++            *thumb = location.TFlag();
++        }
++        return kind;
++    }
++
+     void HaltExecution(HaltReason hr) {
+         Atomic::Or(&halt_reason, static_cast<u32>(hr));
+         Atomic::Barrier();
+@@ -188,6 +214,22 @@ void Jit::Reset() {
+     impl->Reset();
+ }
+ 
++std::size_t Jit::PrecompileBlocks(const std::uint64_t* descriptors, std::size_t count, std::size_t min_remaining_bytes) {
++    return impl->PrecompileBlocks(descriptors, count, min_remaining_bytes);
++}
++
++int Jit::ReverseLookup(const void* host_pc, std::uint32_t* guest_pc, bool* thumb) {
++    return impl->ReverseLookup(host_pc, guest_pc, thumb);
++}
++
++bool Jit::ReverseLookupDescriptor(const void* host_pc, std::uint64_t* descriptor) {
++    return impl->ReverseLookupDescriptor(host_pc, descriptor);
++}
++
++bool Jit::BlockCode(std::uint64_t descriptor, const void** code, std::size_t* size) {
++    return impl->BlockCode(descriptor, code, size);
++}
++
+ void Jit::HaltExecution(HaltReason hr) {
+     impl->HaltExecution(hr);
+ }
+diff --git a/src/dynarmic/backend/arm64/a32_jitstate.h b/src/dynarmic/backend/arm64/a32_jitstate.h
+index 978bf84a..e9db0839 100644
+--- a/src/dynarmic/backend/arm64/a32_jitstate.h
++++ b/src/dynarmic/backend/arm64/a32_jitstate.h
+@@ -30,6 +30,10 @@ struct A32JitState {
+     alignas(16) std::array<u32, 64> ext_regs{};
+ 
+     u32 exclusive_state = 0;
++    // Bridge (dynarmic_bridge_jit_speed.patch, OptimizationFlag::Unsafe_IgnoreGlobalMonitor): address and value of
++    // the last exclusive load; the exclusive store succeeds by compare-and-swap against this value.
++    u32 exclusive_address = 0;
++    u64 exclusive_value = 0;
+ 
+     u32 Cpsr() const;
+     void SetCpsr(u32 cpsr);
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 2c7ae777..ea39bd23 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -3,7 +3,9 @@
+  * SPDX-License-Identifier: 0BSD
+  */
+ 
++#include <cstdint>
+ #include <cstdio>
++#include <ctime>
+ 
+ #include <mcl/bit_cast.hpp>
+ 
+@@ -18,6 +20,38 @@
+ #include "dynarmic/common/llvm_disassemble.h"
+ #include "dynarmic/interface/exclusive_monitor.h"
+ 
++// Bridge diagnostics (arm64_bridge, dynarmic_patches/dynarmic_compile_stats.patch): per-thread
++// translation counters, read by the bridge around a guest call to attribute a slow frame to JIT work.
++namespace {
++thread_local std::uint64_t t_compiled_blocks = 0;
++thread_local std::uint64_t t_compile_ns = 0;
++thread_local std::uint64_t t_cache_clears = 0;
++thread_local std::uint64_t t_remaining = 0;
++thread_local void (*t_recorder)(std::uint64_t descriptor) = nullptr;
++
++std::uint64_t MonotonicNs() {
++    timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return std::uint64_t(ts.tv_sec) * 1000000000u + std::uint64_t(ts.tv_nsec);
++}
++}  // namespace
++
++extern "C" void DynarmicBridgeCompileStats(std::uint64_t* blocks, std::uint64_t* ns, std::uint64_t* clears) {
++    *blocks = t_compiled_blocks;
++    *ns = t_compile_ns;
++    *clears = t_cache_clears;
++}
++
++// Code cache left in the address space that last translated on this thread.
++extern "C" std::uint64_t DynarmicBridgeCodeCacheRemaining() {
++    return t_remaining;
++}
++
++// Called with the descriptor of every block this thread translates (profile recording), or nullptr.
++extern "C" void DynarmicBridgeSetBlockRecorder(void (*recorder)(std::uint64_t descriptor)) {
++    t_recorder = recorder;
++}
++
+ namespace Dynarmic::Backend::Arm64 {
+ 
+ AddressSpace::AddressSpace(size_t code_cache_size)
+@@ -27,6 +61,9 @@ AddressSpace::AddressSpace(size_t code_cache_size)
+         , fastmem_manager(exception_handler) {
+     ASSERT_MSG(code_cache_size <= 128 * 1024 * 1024, "code_cache_size > 128 MiB not currently supported");
+ 
++    fast_dispatch.reset(new FastDispatchEntry[FastDispatchCount]);
++    FastDispatchClear();
++
+     exception_handler.Register(mem, code_cache_size);
+     exception_handler.SetFastmemCallback([this](u64 host_pc) {
+         return FastmemCallback(host_pc);
+@@ -65,12 +102,64 @@ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
+         return block_entry;
+     }
+ 
++    const std::uint64_t start = MonotonicNs();
+     IR::Block ir_block = GenerateIR(descriptor);
+     const EmittedBlockInfo block_info = Emit(std::move(ir_block));
++    t_compile_ns += MonotonicNs() - start;
++    ++t_compiled_blocks;
++    t_remaining = GetRemainingSize();
++    if (t_recorder) t_recorder(descriptor.Value());
+     return block_info.entry_point;
+ }
+ 
++size_t AddressSpace::BridgePrecompile(const std::uint64_t* descriptors, size_t count, size_t min_remaining) {
++    size_t done = 0;
++    for (; done < count && GetRemainingSize() > min_remaining; ++done) {
++        GetOrEmit(IR::LocationDescriptor{descriptors[done]});
++    }
++    return done;
++}
++
++int AddressSpace::BridgeReverseLookup(const void* host_pc, std::uint64_t* descriptor) {
++    const auto* pc = static_cast<const std::byte*>(host_pc);
++    const auto* base = reinterpret_cast<const std::byte*>(mem.ptr());
++    if (pc < base || pc >= base + code_cache_size) {
++        return 0;
++    }
++    if (pc < base + prelude_info.end_of_prelude) {
++        return 2;
++    }
++    auto iter = reverse_block_entries.upper_bound(const_cast<CodePtr>(reinterpret_cast<const std::byte*>(pc)));
++    if (iter == reverse_block_entries.begin()) {
++        return 0;
++    }
++    --iter;
++    *descriptor = iter->second.Value();
++    return 1;
++}
++
++bool AddressSpace::BridgeBlockCode(std::uint64_t descriptor, const void** code_out, std::size_t* size) {
++    const auto entry = block_entries.find(IR::LocationDescriptor{descriptor});
++    if (entry == block_entries.end()) {
++        return false;
++    }
++    const auto info = block_infos.find(entry->second);
++    if (info == block_infos.end()) {
++        return false;
++    }
++    *code_out = info->second->entry_point;
++    *size = info->second->size;
++    return true;
++}
++
++void AddressSpace::FastDispatchClear() {
++    for (size_t i = 0; i < FastDispatchCount; ++i) {
++        fast_dispatch[i] = {~u64(0), nullptr};  // no location descriptor has every bit set
++    }
++}
++
+ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& descriptors) {
++    FastDispatchClear();
+     UnprotectCodeMemory();
+ 
+     for (const auto& descriptor : descriptors) {
+@@ -90,6 +179,9 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
+ }
+ 
+ void AddressSpace::ClearCache() {
++    ++t_cache_clears;
++    bridge_cache_cleared = 1;
++    FastDispatchClear();
+     block_entries.clear();
+     reverse_block_entries.clear();
+     block_infos.clear();
+@@ -114,13 +206,16 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+ 
+     UnprotectCodeMemory();
+ 
+-    EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
++    auto stored = std::make_unique<EmittedBlockInfo>(EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager));
++    EmittedBlockInfo& block_info = *stored;
+ 
+     ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
+     ASSERT(reverse_block_entries.insert({block_info.entry_point, block.Location()}).second);
+-    ASSERT(block_infos.insert({block_info.entry_point, block_info}).second);
++    ASSERT(block_infos.insert({block_info.entry_point, std::move(stored)}).second);
+ 
+     Link(block_info);
++    // Bridge (stage 14): the prelude relocations are patched now and never again (a cache clear drops the block).
++    std::vector<Relocation>().swap(block_info.relocations);
+     RelinkForDescriptor(block.Location(), block_info.entry_point);
+ 
+     mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
+@@ -128,7 +223,7 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+ 
+     RegisterNewBasicBlock(block, block_info);
+ 
+-    return block_info;
++    return EmittedBlockInfo{block_info.entry_point, block_info.size, {}, {}, {}};
+ }
+ 
+ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+@@ -265,8 +360,11 @@ void AddressSpace::Link(EmittedBlockInfo& block_info) {
+         }
+     }
+ 
+-    for (auto [target_descriptor, list] : block_info.block_relocations) {
+-        block_references[target_descriptor].insert(block_info.entry_point);
++    for (const auto& [target_descriptor, list] : block_info.block_relocations) {
++        auto& references = block_references[target_descriptor];
++        if (std::find(references.begin(), references.end(), block_info.entry_point) == references.end()) {
++            references.push_back(block_info.entry_point);
++        }
+         LinkBlockLinks(block_info.entry_point, Get(target_descriptor), list);
+     }
+ }
+@@ -301,12 +399,17 @@ void AddressSpace::LinkBlockLinks(const CodePtr entry_point, const CodePtr targe
+ }
+ 
+ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
+-    for (auto code_ptr : block_references[target_descriptor]) {
++    // Bridge (stage 14): find, not operator[]: a block nobody links to gets no entry.
++    const auto references = block_references.find(target_descriptor);
++    if (references == block_references.end()) {
++        return;
++    }
++    for (auto code_ptr : references->second) {
+         if (auto block_iter = block_infos.find(code_ptr); block_iter != block_infos.end()) {
+-            const EmittedBlockInfo& block_info = block_iter->second;
++            const EmittedBlockInfo& block_info = *block_iter->second;
+ 
+-            if (auto relocation_iter = block_info.block_relocations.find(target_descriptor); relocation_iter != block_info.block_relocations.end()) {
+-                LinkBlockLinks(block_info.entry_point, target_ptr, relocation_iter->second);
++            if (const auto* relocations = block_info.block_relocations.Find(target_descriptor)) {
++                LinkBlockLinks(block_info.entry_point, target_ptr, *relocations);
+             }
+ 
+             mem.invalidate(reinterpret_cast<u32*>(block_info.entry_point), block_info.size);
+@@ -328,15 +431,15 @@ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
+             goto fail;
+         }
+ 
+-        const auto patch_entry = block_info->second.fastmem_patch_info.find(host_ptr - entry_point);
+-        if (patch_entry == block_info->second.fastmem_patch_info.end()) {
++        const FastmemPatchInfo* patch_entry = block_info->second->fastmem_patch_info.Find(host_ptr - entry_point);
++        if (!patch_entry) {
+             goto fail;
+         }
+ 
+-        const auto fc = patch_entry->second.fc;
++        const auto fc = patch_entry->fc;
+ 
+-        if (patch_entry->second.recompile) {
+-            const auto marker = patch_entry->second.marker;
++        if (patch_entry->recompile) {
++            const auto marker = patch_entry->marker;
+             fastmem_manager.MarkDoNotFastmem(marker);
+             InvalidateBasicBlocks({std::get<0>(marker)});
+         }
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 835566bd..288a5db4 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -6,6 +6,7 @@
+ #pragma once
+ 
+ #include <map>
++#include <memory>
+ #include <optional>
+ 
+ #include <mcl/stdint.hpp>
+@@ -45,6 +46,37 @@ public:
+ 
+     void DumpDisassembly() const;
+ 
++    // Bridge JIT warm-up (dynarmic_patches/dynarmic_compile_stats.patch): translate recorded block
++    // descriptors ahead of execution while more than min_remaining bytes of code cache are left.
++    size_t BridgePrecompile(const std::uint64_t* descriptors, size_t count, size_t min_remaining);
++    size_t BridgeRemainingSize() { return GetRemainingSize(); }
++    // Bridge sampling profiler (dynarmic_patches/dynarmic_bridge_profiler.patch): where a host pc of this address
++    // space's code cache came from. 0 = not in the code cache, 1 = emitted block (its IR location descriptor),
++    // 2 = prelude (dispatcher, memory and callback trampolines). Call from the owning thread outside Run.
++    int BridgeReverseLookup(const void* host_pc, std::uint64_t* descriptor);
++    // Host code of the block emitted for a descriptor (profiling dumps); false if there is none.
++    bool BridgeBlockCode(std::uint64_t descriptor, const void** code, std::size_t* size);
++
++    // Bridge fast dispatch (dynarmic_patches/dynarmic_bridge_jit_speed.patch): a direct-mapped table location ->
++    // host code that the prelude's dispatcher probes in assembly before it calls GetOrEmit (upstream left
++    // FastDispatchHint as a TODO on arm64; every indirect branch and return-stack miss paid a robin_map lookup).
++    // Cleared whenever blocks are invalidated or the cache is cleared.
++    struct FastDispatchEntry {
++        u64 location;
++        CodePtr code;
++    };
++    static constexpr size_t FastDispatchBits = 12;
++    static constexpr size_t FastDispatchCount = size_t(1) << FastDispatchBits;
++    static size_t FastDispatchIndex(u64 location) {
++        const u32 pc = static_cast<u32>(location);
++        const u32 upper = static_cast<u32>(location >> 32);
++        return (upper ^ (pc >> 1) ^ (pc >> 13)) & (FastDispatchCount - 1);
++    }
++    void FastDispatchStore(u64 location, CodePtr code_ptr) {
++        fast_dispatch[FastDispatchIndex(location)] = {location, code_ptr};
++    }
++    void FastDispatchClear();
++
+ protected:
+     virtual EmitConfig GetEmitConfig() = 0;
+     virtual void RegisterNewBasicBlock(const IR::Block& block, const EmittedBlockInfo& block_info) = 0;
+@@ -77,8 +109,14 @@ protected:
+     // However, there can be multiple other CodePtrs which are older, previously invalidated blocks.
+     tsl::robin_map<IR::LocationDescriptor, CodePtr> block_entries;
+     std::map<CodePtr, IR::LocationDescriptor> reverse_block_entries;
+-    tsl::robin_map<CodePtr, EmittedBlockInfo> block_infos;
+-    tsl::robin_map<IR::LocationDescriptor, tsl::robin_set<CodePtr>> block_references;
++    tsl::robin_map<CodePtr, std::unique_ptr<EmittedBlockInfo>> block_infos;  // bridge: pointers (stage 14)
++    std::unique_ptr<FastDispatchEntry[]> fast_dispatch;
++    // Bridge (stage 14): set by ClearCache. The prelude's dispatcher reads it after GetOrEmit: a clear there (code
++    // cache full while the guest runs) leaves the running Run()'s return stack buffer pointing into old code that
++    // the next blocks overwrite, so the dispatcher sends those entries back to itself and resets the flag.
++    u32 bridge_cache_cleared = 0;
++    // bridge (stage 14): the blocks that link to a target, a short vector instead of a robin_set per target
++    tsl::robin_map<IR::LocationDescriptor, std::vector<CodePtr>> block_references;
+ 
+     ExceptionHandler exception_handler;
+     FastmemManager fastmem_manager;
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.cpp b/src/dynarmic/backend/arm64/emit_arm64.cpp
+index 1ecb5424..02bc192c 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64.cpp
+@@ -6,6 +6,7 @@
+ #include "dynarmic/backend/arm64/emit_arm64.h"
+ 
+ #include <oaknut/oaknut.hpp>
++#include <tsl/robin_map.h>
+ 
+ #include "dynarmic/backend/arm64/abi.h"
+ #include "dynarmic/backend/arm64/emit_context.h"
+@@ -191,6 +192,51 @@ static void EmitAddCycles(oaknut::CodeGenerator& code, EmitContext& ctx, size_t
+     }
+ }
+ 
++// Bridge (dynarmic_bridge_jit_speed.patch): consumers that read their operands from vector registers.
++static bool ReadsOperandsFromFpr(IR::Opcode op) {
++    switch (op) {
++    case IR::Opcode::A32SetExtendedRegister32:
++    case IR::Opcode::A32SetExtendedRegister64:
++    case IR::Opcode::FPAbs32:
++    case IR::Opcode::FPAbs64:
++    case IR::Opcode::FPAdd32:
++    case IR::Opcode::FPAdd64:
++    case IR::Opcode::FPCompare32:
++    case IR::Opcode::FPCompare64:
++    case IR::Opcode::FPDiv32:
++    case IR::Opcode::FPDiv64:
++    case IR::Opcode::FPMax32:
++    case IR::Opcode::FPMax64:
++    case IR::Opcode::FPMaxNumeric32:
++    case IR::Opcode::FPMaxNumeric64:
++    case IR::Opcode::FPMin32:
++    case IR::Opcode::FPMin64:
++    case IR::Opcode::FPMinNumeric32:
++    case IR::Opcode::FPMinNumeric64:
++    case IR::Opcode::FPMul32:
++    case IR::Opcode::FPMul64:
++    case IR::Opcode::FPMulAdd32:
++    case IR::Opcode::FPMulAdd64:
++    case IR::Opcode::FPMulSub32:
++    case IR::Opcode::FPMulSub64:
++    case IR::Opcode::FPNeg32:
++    case IR::Opcode::FPNeg64:
++    case IR::Opcode::FPSqrt32:
++    case IR::Opcode::FPSqrt64:
++    case IR::Opcode::FPSub32:
++    case IR::Opcode::FPSub64:
++    case IR::Opcode::FPSingleToDouble:
++    case IR::Opcode::FPDoubleToSingle:
++    case IR::Opcode::FPSingleToFixedS32:
++    case IR::Opcode::FPSingleToFixedU32:
++    case IR::Opcode::FPDoubleToFixedS32:
++    case IR::Opcode::FPDoubleToFixedU32:
++        return true;
++    default:
++        return false;
++    }
++}
++
+ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const EmitConfig& conf, FastmemManager& fastmem_manager) {
+     if (conf.very_verbose_debugging_output) {
+         std::puts(IR::DumpBlock(block).c_str());
+@@ -198,10 +244,34 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
+ 
+     EmittedBlockInfo ebi;
+ 
+-    FpsrManager fpsr_manager{code, conf.state_fpsr_offset};
++    FpsrManager fpsr_manager{code, conf.state_fpsr_offset, !conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreFPSRAccumulation)};
+     RegAlloc reg_alloc{code, fpsr_manager, GPR_ORDER, FPR_ORDER};
+     EmitContext ctx{block, reg_alloc, conf, ebi, fpsr_manager, fastmem_manager, {}};
+ 
++    {
++        // 1: every use so far reads from a vector register, 2: some use does not
++        tsl::robin_map<const IR::Inst*, int> uses;
++        for (const auto& inst : block) {
++            const bool fpr = ReadsOperandsFromFpr(inst.GetOpcode());
++            for (size_t i = 0; i < inst.NumArgs(); ++i) {
++                const IR::Value arg = inst.GetArg(i);
++                if (arg.IsImmediate()) {
++                    continue;
++                }
++                const auto [it, inserted] = uses.try_emplace(arg.GetInst(), fpr ? 1 : 2);
++                if (!inserted && !fpr) {
++                    it.value() = 2;
++                }
++            }
++        }
++        for (const auto& [value, kind] : uses) {
++            const IR::Opcode op = value->GetOpcode();
++            if (kind == 1 && (op == IR::Opcode::A32ReadMemory32 || op == IR::Opcode::A32ReadMemory64)) {
++                ctx.fpr_loads.insert(value);
++            }
++        }
++    }
++
+     ebi.entry_point = code.xptr<CodePtr>();
+ 
+     if (ctx.block.GetCondition() == IR::Cond::AL) {
+@@ -264,6 +334,8 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
+     code.BRK(0);
+ 
+     ebi.size = code.xptr<CodePtr>() - ebi.entry_point;
++    ebi.block_relocations.Finish();
++    ebi.fastmem_patch_info.Finish();
+     return ebi;
+ }
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64.h b/src/dynarmic/backend/arm64/emit_arm64.h
+index 58ccb0e4..29b44735 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64.h
++++ b/src/dynarmic/backend/arm64/emit_arm64.h
+@@ -5,9 +5,11 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstddef>
+ #include <memory>
++#include <utility>
+ #include <vector>
+ 
+ #include <mcl/stdint.hpp>
+@@ -98,12 +100,58 @@ struct BlockRelocation {
+     BlockRelocationType type;
+ };
+ 
++// Bridge (stage 14): a block keeps its EmittedBlockInfo until the whole cache is cleared. With a tsl::robin_map for its
++// links and one for its fastmem patch points (power-of-two bucket arrays at a load factor of at most 0.5) and the
++// info itself stored in the buckets of AddressSpace::block_infos, a block cost about 2-3 KiB of host memory, a few
++// hundred MiB for the game's GL thread after some races. Both tables are short sorted/linear vectors now, the
++// prelude relocations are dropped once linked (AddressSpace::Emit) and block_infos holds pointers.
++struct BlockRelocationTable {  // block links by target block; usually one or two targets
++    std::vector<std::pair<IR::LocationDescriptor, std::vector<BlockRelocation>>> items;
++    std::vector<BlockRelocation>& operator[](const IR::LocationDescriptor& target) {
++        for (auto& item : items) {
++            if (item.first == target) {
++                return item.second;
++            }
++        }
++        return items.emplace_back(target, std::vector<BlockRelocation>{}).second;
++    }
++    const std::vector<BlockRelocation>* Find(const IR::LocationDescriptor& target) const {
++        for (const auto& item : items) {
++            if (item.first == target) {
++                return &item.second;
++            }
++        }
++        return nullptr;
++    }
++    auto begin() const { return items.begin(); }
++    auto end() const { return items.end(); }
++    void Finish() {
++        items.shrink_to_fit();
++        for (auto& item : items) {
++            item.second.shrink_to_fit();
++        }
++    }
++};
++
++struct FastmemPatchTable {  // fastmem patch points by code offset, sorted once the block is emitted
++    std::vector<std::pair<std::ptrdiff_t, FastmemPatchInfo>> items;
++    void emplace(std::ptrdiff_t offset, const FastmemPatchInfo& info) { items.emplace_back(offset, info); }
++    const FastmemPatchInfo* Find(std::ptrdiff_t offset) const {
++        const auto it = std::lower_bound(items.begin(), items.end(), offset, [](const auto& item, std::ptrdiff_t key) { return item.first < key; });
++        return it != items.end() && it->first == offset ? &it->second : nullptr;
++    }
++    void Finish() {
++        std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
++        items.shrink_to_fit();
++    }
++};
++
+ struct EmittedBlockInfo {
+     CodePtr entry_point;
+     size_t size;
+     std::vector<Relocation> relocations;
+-    tsl::robin_map<IR::LocationDescriptor, std::vector<BlockRelocation>> block_relocations;
+-    tsl::robin_map<std::ptrdiff_t, FastmemPatchInfo> fastmem_patch_info;
++    BlockRelocationTable block_relocations;
++    FastmemPatchTable fastmem_patch_info;
+ };
+ 
+ struct EmitConfig {
+@@ -155,6 +203,11 @@ struct EmitConfig {
+     size_t state_nzcv_offset;
+     size_t state_fpsr_offset;
+     size_t state_exclusive_state_offset;
++    size_t state_exclusive_address_offset = 0;  // bridge: inline exclusives (A32 only)
++    size_t state_exclusive_value_offset = 0;
++    // bridge: the address space's fast dispatch table (AddressSpace::FastDispatchEntry[FastDispatchCount]), probed
++    // inline at indirect-branch terminals (A32 only; null = no inline probe)
++    const void* fast_dispatch_table = nullptr;
+ 
+     // A32 specific
+     std::array<std::shared_ptr<A32::Coprocessor>, 16> coprocessors{};
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index 909dde73..2e8f23f2 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <mcl/bit/bit_field.hpp>
++#include <mcl/bit_cast.hpp>
+ #include <oaknut/oaknut.hpp>
+ 
+ #include "dynarmic/backend/arm64/a32_jitstate.h"
+@@ -33,8 +34,19 @@ oaknut::Label EmitA32Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond co
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+ 
+-void EmitA32Terminal(oaknut::CodeGenerator&, EmitContext&, IR::Term::Interpret, IR::LocationDescriptor, bool) {
+-    ASSERT_FALSE("Interpret should never be emitted.");
++void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Interpret terminal, IR::LocationDescriptor initial_location, bool) {
++    // MC4 arm32-to-arm64 bridge patch: the A32 frontend emits Interpret for
++    // instructions this backend does not implement (CPS, MRS, LDM user
++    // variants, ...). The upstream x64 backend calls UserCallbacks::
++    // InterpreterFallback here; the arm64 backend has no interpreter, and
++    // asserting aborts the whole process mid-game. Treat the instruction as
++    // a no-op instead: advance past it and return to the dispatcher, which
++    // JITs the next instruction.
++    const A32::LocationDescriptor next{terminal.next};
++    const u32 advance = next.TFlag() ? 2 : 4;
++    code.MOV(Wscratch1, next.PC() + advance);
++    code.STR(Wscratch1, Xstate, offsetof(A32JitState, regs) + sizeof(u32) * 15);
++    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+ }
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::ReturnToDispatch, IR::LocationDescriptor, bool) {
+@@ -93,6 +105,35 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Li
+     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+ }
+ 
++// Bridge (dynarmic_bridge_jit_speed.patch): probe the address space's fast dispatch table right at an indirect-branch
++// terminal (the same probe as the prelude's dispatcher, see AddressSpace::FastDispatchIndex). Every call site gets
++// its own indirect branch, which the host's branch predictor tracks per site, instead of all indirect branches of
++// the guest funnelling through the one in the prelude. Falls through on a halt request or a table miss.
++static void EmitInlineFastDispatch(oaknut::CodeGenerator& code, EmitContext& ctx) {
++    if (!ctx.conf.fast_dispatch_table) {
++        return;
++    }
++    oaknut::Label miss, l_table;
++    static_assert(offsetof(A32JitState, regs) + 16 * sizeof(u32) == offsetof(A32JitState, upper_location_descriptor));
++    code.LDAR(Wscratch0, Xhalt);
++    code.CBNZ(Wscratch0, miss);
++    code.LDUR(X0, Xstate, offsetof(A32JitState, regs) + 15 * sizeof(u32));
++    code.LSR(X1, X0, 32);
++    code.EOR(W1, W1, W0, oaknut::LogShift::LSR, 1);
++    code.EOR(W1, W1, W0, oaknut::LogShift::LSR, 13);
++    code.AND(W1, W1, 0xfff);
++    code.LDR(X2, l_table);
++    code.ADD(X2, X2, X1, oaknut::AddSubShift::LSL, 4);
++    code.LDP(X3, X4, X2);
++    code.CMP(X3, X0);
++    code.B(NE, miss);
++    code.BR(X4);
++    code.align(8);
++    code.l(l_table);
++    code.dx(mcl::bit_cast<u64>(ctx.conf.fast_dispatch_table));
++    code.l(miss);
++}
++
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::PopRSBHint, IR::LocationDescriptor, bool is_single_step) {
+     if (ctx.conf.HasOptimization(OptimizationFlag::ReturnStackBuffer) && !is_single_step) {
+         oaknut::Label fail;
+@@ -113,15 +154,17 @@ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Po
+         code.BR(Xscratch1);
+ 
+         code.l(fail);
++        EmitInlineFastDispatch(code, ctx);
+     }
+ 
+     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+ }
+ 
+-void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool) {
++void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::FastDispatchHint, IR::LocationDescriptor, bool is_single_step) {
++    if (!is_single_step) {
++        EmitInlineFastDispatch(code, ctx);
++    }
+     EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+-
+-    // TODO: Implement FastDispatchHint optimization
+ }
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::If terminal, IR::LocationDescriptor initial_location, bool is_single_step) {
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+index 5115fbbb..f27b8dc9 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32_coprocessor.cpp
+@@ -19,8 +19,15 @@ namespace Dynarmic::Backend::Arm64 {
+ 
+ using namespace oaknut::util;
+ 
+-static void EmitCoprocessorException() {
+-    ASSERT_FALSE("Should raise coproc exception here");
++// The MC4 guest contains no legitimate CP15 instructions; coproc words only
++// appear when the JIT translates junk during code slides, and this backend's
++// coproc register-allocation paths assert (Realize/PrepareForCall). Raise a
++// guest exception through the proven A32ExceptionRaised emission instead.
++static void EmitCoprocessorException(oaknut::CodeGenerator& code, EmitContext& ctx) {
++    ctx.reg_alloc.PrepareForCall();
++    code.MOV(W1, 0);
++    code.MOV(W2, 1);
++    EmitRelocation(code, ctx, LinkTarget::ExceptionRaised);
+ }
+ 
+ static void CallCoprocCallback(oaknut::CodeGenerator& code, EmitContext& ctx, A32::Coprocessor::Callback callback, IR::Inst* inst = nullptr, std::optional<Argument::copyable_reference> arg0 = {}, std::optional<Argument::copyable_reference> arg1 = {}) {
+@@ -51,13 +58,13 @@ void EmitIR<IR::Opcode::A32CoprocInternalOperation>(oaknut::CodeGenerator& code,
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+     const auto action = coproc->CompileInternalOperation(two, opc1, CRd, CRn, CRm, opc2);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+@@ -77,14 +84,14 @@ void EmitIR<IR::Opcode::A32CoprocSendOneWord>(oaknut::CodeGenerator& code, EmitC
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+     const auto action = coproc->CompileSendOneWord(two, opc1, CRn, CRm, opc2);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+@@ -118,14 +125,14 @@ void EmitIR<IR::Opcode::A32CoprocSendTwoWords>(oaknut::CodeGenerator& code, Emit
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+     const auto action = coproc->CompileSendTwoWords(two, opc, CRm);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+@@ -163,14 +170,14 @@ void EmitIR<IR::Opcode::A32CoprocGetOneWord>(oaknut::CodeGenerator& code, EmitCo
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+     const auto action = coproc->CompileGetOneWord(two, opc1, CRn, CRm, opc2);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+@@ -202,14 +209,14 @@ void EmitIR<IR::Opcode::A32CoprocGetTwoWords>(oaknut::CodeGenerator& code, EmitC
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+     auto action = coproc->CompileGetTwoWords(two, opc, CRm);
+ 
+     if (std::holds_alternative<std::monostate>(action)) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+@@ -252,13 +259,13 @@ void EmitIR<IR::Opcode::A32CoprocLoadWords>(oaknut::CodeGenerator& code, EmitCon
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+     const auto action = coproc->CompileLoadWords(two, long_transfer, CRd, option);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+@@ -283,13 +290,13 @@ void EmitIR<IR::Opcode::A32CoprocStoreWords>(oaknut::CodeGenerator& code, EmitCo
+ 
+     std::shared_ptr<A32::Coprocessor> coproc = ctx.conf.coprocessors[coproc_num];
+     if (!coproc) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+     const auto action = coproc->CompileStoreWords(two, long_transfer, CRd, option);
+     if (!action) {
+-        EmitCoprocessorException();
++        EmitCoprocessorException(code, ctx);
+         return;
+     }
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+index 339e2c59..2ad3cb8c 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_memory.cpp
+@@ -625,11 +625,108 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
+     code.l(*end);
+ }
+ 
++// Bridge (dynarmic_bridge_jit_speed.patch): fastmem accesses whose value lives in a vector register (S for 32 bits,
++// D for 64 bits). Same fault handling as FastmemEmitReadMemory / FastmemEmitWriteMemory; the fallback moves the value
++// between the vector register and the general registers of the call trampolines.
++template<size_t bitsize>
++void FastmemEmitReadMemoryFpr(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
++    static_assert(bitsize == 32 || bitsize == 64);
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
++    auto Vvalue = ctx.reg_alloc.WriteVec<bitsize>(inst);
++    ctx.fpsr.Spill();
++    ctx.reg_alloc.SpillFlags();
++    RegAlloc::Realize(Xaddr, Vvalue);
++
++    SharedLabel fallback = GenSharedLabel(), end = GenSharedLabel();
++
++    const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
++    const auto index_ext = ShouldExt32(ctx) ? oaknut::IndexExt::UXTW : oaknut::IndexExt::LSL;
++    const auto Roffset = ShouldExt32(ctx) ? oaknut::RReg{Xoffset.toW()} : oaknut::RReg{Xoffset};
++    const CodePtr fastmem_location = code.xptr<CodePtr>();
++    code.LDR(*Vvalue, Xbase, Roffset, index_ext);
++
++    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Vvalue = *Vvalue, fallback, end, fastmem_location] {
++        ctx.ebi.fastmem_patch_info.emplace(
++            fastmem_location - ctx.ebi.entry_point,
++            FastmemPatchInfo{
++                .marker = marker,
++                .fc = FakeCall{
++                    .call_pc = mcl::bit_cast<u64>(code.xptr<void*>()),
++                },
++                .recompile = ctx.conf.recompile_on_fastmem_failure,
++            });
++
++        code.l(*fallback);
++        code.MOV(Xscratch0, Xaddr);
++        EmitRelocation(code, ctx, WrappedReadMemoryLinkTarget(bitsize));
++        if constexpr (bitsize == 32) {
++            code.FMOV(Vvalue, Wscratch0);
++        } else {
++            code.FMOV(Vvalue, Xscratch0);
++        }
++        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
++        code.B(*end);
++    });
++
++    code.l(*end);
++}
++
++template<size_t bitsize>
++void FastmemEmitWriteMemoryFpr(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst, DoNotFastmemMarker marker) {
++    static_assert(bitsize == 32 || bitsize == 64);
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
++    auto Vvalue = ctx.reg_alloc.ReadVec<bitsize>(args[2]);
++    ctx.fpsr.Spill();
++    ctx.reg_alloc.SpillFlags();
++    RegAlloc::Realize(Xaddr, Vvalue);
++
++    SharedLabel fallback = GenSharedLabel(), end = GenSharedLabel();
++
++    const auto [Xbase, Xoffset] = FastmemEmitVAddrLookup<bitsize>(code, ctx, Xaddr, fallback);
++    const auto index_ext = ShouldExt32(ctx) ? oaknut::IndexExt::UXTW : oaknut::IndexExt::LSL;
++    const auto Roffset = ShouldExt32(ctx) ? oaknut::RReg{Xoffset.toW()} : oaknut::RReg{Xoffset};
++    const CodePtr fastmem_location = code.xptr<CodePtr>();
++    code.STR(*Vvalue, Xbase, Roffset, index_ext);
++
++    ctx.deferred_emits.emplace_back([&code, &ctx, inst, marker, Xaddr = *Xaddr, Vvalue = *Vvalue, fallback, end, fastmem_location] {
++        ctx.ebi.fastmem_patch_info.emplace(
++            fastmem_location - ctx.ebi.entry_point,
++            FastmemPatchInfo{
++                .marker = marker,
++                .fc = FakeCall{
++                    .call_pc = mcl::bit_cast<u64>(code.xptr<void*>()),
++                },
++                .recompile = ctx.conf.recompile_on_fastmem_failure,
++            });
++
++        code.l(*fallback);
++        code.MOV(Xscratch0, Xaddr);
++        if constexpr (bitsize == 32) {
++            code.FMOV(Wscratch1, Vvalue);
++        } else {
++            code.FMOV(Xscratch1, Vvalue);
++        }
++        EmitRelocation(code, ctx, WrappedWriteMemoryLinkTarget(bitsize));
++        ctx.conf.emit_check_memory_abort(code, ctx, inst, *end);
++        code.B(*end);
++    });
++
++    code.l(*end);
++}
++
+ }  // namespace
+ 
+ template<size_t bitsize>
+ void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+     if (const auto marker = ShouldFastmem(ctx, inst)) {
++        if constexpr (bitsize == 32 || bitsize == 64) {
++            if (ctx.fpr_loads.contains(inst) && !IsOrdered(inst->GetArg(2).GetAccType())) {
++                FastmemEmitReadMemoryFpr<bitsize>(code, ctx, inst, *marker);
++                return;
++            }
++        }
+         FastmemEmitReadMemory<bitsize>(code, ctx, inst, *marker);
+     } else if (ctx.conf.page_table_pointer != 0) {
+         InlinePageTableEmitReadMemory<bitsize>(code, ctx, inst);
+@@ -638,14 +735,123 @@ void EmitReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* ins
+     }
+ }
+ 
++// Bridge (dynarmic_bridge_jit_speed.patch): exclusives without the global monitor
++// (OptimizationFlag::Unsafe_IgnoreGlobalMonitor, fastmem, A32). The exclusive load is a plain load that records the
++// address and the value in the JIT state; the exclusive store succeeds when the location still holds that value,
++// by an LDXR/STXR compare-and-swap loop with no other memory access inside. The engine's reference counts and locks
++// otherwise paid a call into C++, a spin lock and a spill of every live register for each LDREX and STREX. Like any
++// compare-and-swap emulation it cannot see an A-B-A change of the location between the two instructions.
++static bool InlineExclusives(EmitContext& ctx) {
++    return ctx.conf.fastmem_pointer && ctx.conf.state_exclusive_value_offset != 0 && ShouldExt32(ctx)
++        && ctx.conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor);
++}
++
++template<size_t bitsize>
++void InlineEmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    static_assert(bitsize == 8 || bitsize == 16 || bitsize == 32 || bitsize == 64);
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
++    auto Rvalue = ctx.reg_alloc.WriteReg<std::max<std::size_t>(bitsize, 32)>(inst);
++    const bool ordered = IsOrdered(args[2].GetImmediateAccType());
++    RegAlloc::Realize(Xaddr, Rvalue);
++
++    code.ADD(Xscratch0, Xfastmem, Xaddr->toW(), oaknut::AddSubExt::UXTW);
++    if constexpr (bitsize == 8) {
++        code.LDRB(Rvalue->toW(), Xscratch0);
++    } else if constexpr (bitsize == 16) {
++        code.LDRH(Rvalue->toW(), Xscratch0);
++    } else if constexpr (bitsize == 32) {
++        code.LDR(Rvalue->toW(), Xscratch0);
++    } else {
++        code.LDR(Rvalue->toX(), Xscratch0);
++    }
++    if (ordered) {
++        code.DMB(oaknut::BarrierOp::ISH);
++    }
++    code.MOV(Wscratch1, 1);
++    code.STRB(Wscratch1, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.STR(Xaddr->toW(), Xstate, ctx.conf.state_exclusive_address_offset);
++    code.STR(Rvalue->toX(), Xstate, ctx.conf.state_exclusive_value_offset);
++}
++
++template<size_t bitsize>
++void InlineEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    static_assert(bitsize == 8 || bitsize == 16 || bitsize == 32 || bitsize == 64);
++    auto args = ctx.reg_alloc.GetArgumentInfo(inst);
++    auto Xaddr = ctx.reg_alloc.ReadX(args[1]);
++    auto Rvalue = ctx.reg_alloc.ReadReg<std::max<std::size_t>(bitsize, 32)>(args[2]);
++    auto Wresult = ctx.reg_alloc.WriteW(inst);
++    const bool ordered = IsOrdered(args[3].GetImmediateAccType());
++    RegAlloc::Realize(Xaddr, Rvalue, Wresult);
++
++    oaknut::Label loop, mismatch, end;
++
++    if (ordered) {
++        code.DMB(oaknut::BarrierOp::ISH);
++    }
++    code.MOV(*Wresult, 1);
++    code.LDRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.CBZ(Wscratch0, end);
++    code.STRB(WZR, Xstate, ctx.conf.state_exclusive_state_offset);
++    code.LDR(Wscratch0, Xstate, ctx.conf.state_exclusive_address_offset);
++    code.CMP(Wscratch0, Xaddr->toW());
++    code.B(NE, end);
++    code.LDR(Xscratch2, Xstate, ctx.conf.state_exclusive_value_offset);
++    code.ADD(Xscratch0, Xfastmem, Xaddr->toW(), oaknut::AddSubExt::UXTW);
++    code.l(loop);
++    if constexpr (bitsize == 8) {
++        code.LDXRB(Wscratch1, Xscratch0);
++        code.CMP(Wscratch1, Xscratch2.toW());
++        code.B(NE, mismatch);
++        code.STXRB(*Wresult, Rvalue->toW(), Xscratch0);
++    } else if constexpr (bitsize == 16) {
++        code.LDXRH(Wscratch1, Xscratch0);
++        code.CMP(Wscratch1, Xscratch2.toW());
++        code.B(NE, mismatch);
++        code.STXRH(*Wresult, Rvalue->toW(), Xscratch0);
++    } else if constexpr (bitsize == 32) {
++        code.LDXR(Wscratch1, Xscratch0);
++        code.CMP(Wscratch1, Xscratch2.toW());
++        code.B(NE, mismatch);
++        code.STXR(*Wresult, Rvalue->toW(), Xscratch0);
++    } else {
++        code.LDXR(Xscratch1, Xscratch0);
++        code.CMP(Xscratch1, Xscratch2);
++        code.B(NE, mismatch);
++        code.STXR(*Wresult, Rvalue->toX(), Xscratch0);
++    }
++    code.CBNZ(*Wresult, loop);
++    if (ordered) {
++        code.DMB(oaknut::BarrierOp::ISH);
++    }
++    code.B(end);
++    code.l(mismatch);
++    code.CLREX();
++    code.MOV(*Wresult, 1);
++    code.l(end);
++}
++
+ template<size_t bitsize>
+ void EmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    if constexpr (bitsize <= 64) {
++        if (InlineExclusives(ctx)) {
++            InlineEmitExclusiveReadMemory<bitsize>(code, ctx, inst);
++            return;
++        }
++    }
+     CallbackOnlyEmitExclusiveReadMemory<bitsize>(code, ctx, inst);
+ }
+ 
+ template<size_t bitsize>
+ void EmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
+     if (const auto marker = ShouldFastmem(ctx, inst)) {
++        if constexpr (bitsize == 32 || bitsize == 64) {
++            const IR::Value value = inst->GetArg(2);
++            if (!value.IsImmediate() && !IsOrdered(inst->GetArg(3).GetAccType()) && ctx.reg_alloc.IsValueInFpr(value.GetInst())) {
++                FastmemEmitWriteMemoryFpr<bitsize>(code, ctx, inst, *marker);
++                return;
++            }
++        }
+         FastmemEmitWriteMemory<bitsize>(code, ctx, inst, *marker);
+     } else if (ctx.conf.page_table_pointer != 0) {
+         InlinePageTableEmitWriteMemory<bitsize>(code, ctx, inst);
+@@ -656,6 +862,12 @@ void EmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* in
+ 
+ template<size_t bitsize>
+ void EmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Inst* inst) {
++    if constexpr (bitsize <= 64) {
++        if (InlineExclusives(ctx)) {
++            InlineEmitExclusiveWriteMemory<bitsize>(code, ctx, inst);
++            return;
++        }
++    }
+     CallbackOnlyEmitExclusiveWriteMemory<bitsize>(code, ctx, inst);
+ }
+ 
+diff --git a/src/dynarmic/backend/arm64/emit_context.h b/src/dynarmic/backend/arm64/emit_context.h
+index 6bfc6f3c..420bb74b 100644
+--- a/src/dynarmic/backend/arm64/emit_context.h
++++ b/src/dynarmic/backend/arm64/emit_context.h
+@@ -9,6 +9,8 @@
+ #include <memory>
+ #include <vector>
+ 
++#include <tsl/robin_set.h>
++
+ #include <oaknut/oaknut.hpp>
+ 
+ #include "dynarmic/backend/arm64/emit_arm64.h"
+@@ -42,6 +44,11 @@ struct EmitContext {
+ 
+     std::vector<std::function<void()>> deferred_emits;
+ 
++    // Bridge (dynarmic_patches/dynarmic_bridge_jit_speed.patch): 32/64-bit memory reads whose every use is a
++    // floating-point instruction or an extension-register write. The fastmem path loads them straight into a vector
++    // register instead of a general register followed by FMOV.
++    tsl::robin_set<const IR::Inst*> fpr_loads{};
++
+     FP::FPCR FPCR(bool fpcr_controlled = true) const {
+         const FP::FPCR fpcr = conf.descriptor_to_fpcr(block.Location());
+         return fpcr_controlled ? fpcr : fpcr.ASIMDStandardValue();
+diff --git a/src/dynarmic/backend/arm64/exclusive_monitor.cpp b/src/dynarmic/backend/arm64/exclusive_monitor.cpp
+index d57a29cd..192f1600 100644
+--- a/src/dynarmic/backend/arm64/exclusive_monitor.cpp
++++ b/src/dynarmic/backend/arm64/exclusive_monitor.cpp
+@@ -12,7 +12,7 @@
+ namespace Dynarmic {
+ 
+ ExclusiveMonitor::ExclusiveMonitor(size_t processor_count)
+-        : exclusive_addresses(processor_count, INVALID_EXCLUSIVE_ADDRESS), exclusive_values(processor_count) {}
++        : exclusive_addresses(processor_count, INVALID_EXCLUSIVE_ADDRESS), scan_limit(processor_count), exclusive_values(processor_count) {}
+ 
+ size_t ExclusiveMonitor::GetProcessorCount() const {
+     return exclusive_addresses.size();
+@@ -35,14 +35,20 @@ bool ExclusiveMonitor::CheckAndClear(size_t processor_id, VAddr address) {
+         return false;
+     }
+ 
+-    for (VAddr& other_address : exclusive_addresses) {
+-        if (other_address == masked_address) {
+-            other_address = INVALID_EXCLUSIVE_ADDRESS;
++    for (size_t i = 0; i < scan_limit; ++i) {
++        if (exclusive_addresses[i] == masked_address) {
++            exclusive_addresses[i] = INVALID_EXCLUSIVE_ADDRESS;
+         }
+     }
+     return true;
+ }
+ 
++void ExclusiveMonitor::SetScanLimit(size_t limit) {
++    Lock();
++    scan_limit = std::min(limit, exclusive_addresses.size());
++    Unlock();
++}
++
+ void ExclusiveMonitor::Clear() {
+     Lock();
+     std::fill(exclusive_addresses.begin(), exclusive_addresses.end(), INVALID_EXCLUSIVE_ADDRESS);
+diff --git a/src/dynarmic/backend/arm64/fpsr_manager.cpp b/src/dynarmic/backend/arm64/fpsr_manager.cpp
+index 1c614745..bdc38654 100644
+--- a/src/dynarmic/backend/arm64/fpsr_manager.cpp
++++ b/src/dynarmic/backend/arm64/fpsr_manager.cpp
+@@ -13,8 +13,8 @@ namespace Dynarmic::Backend::Arm64 {
+ 
+ using namespace oaknut::util;
+ 
+-FpsrManager::FpsrManager(oaknut::CodeGenerator& code, size_t state_fpsr_offset)
+-        : code{code}, state_fpsr_offset{state_fpsr_offset} {}
++FpsrManager::FpsrManager(oaknut::CodeGenerator& code, size_t state_fpsr_offset, bool enabled)
++        : code{code}, state_fpsr_offset{state_fpsr_offset}, enabled{enabled} {}
+ 
+ void FpsrManager::Spill() {
+     if (!fpsr_loaded)
+@@ -29,7 +29,7 @@ void FpsrManager::Spill() {
+ }
+ 
+ void FpsrManager::Load() {
+-    if (fpsr_loaded)
++    if (fpsr_loaded || !enabled)
+         return;
+ 
+     code.MSR(oaknut::SystemReg::FPSR, XZR);
+diff --git a/src/dynarmic/backend/arm64/fpsr_manager.h b/src/dynarmic/backend/arm64/fpsr_manager.h
+index 9e5d68bf..5ab74fc7 100644
+--- a/src/dynarmic/backend/arm64/fpsr_manager.h
++++ b/src/dynarmic/backend/arm64/fpsr_manager.h
+@@ -16,7 +16,8 @@ namespace Dynarmic::Backend::Arm64 {
+ 
+ class FpsrManager {
+ public:
+-    explicit FpsrManager(oaknut::CodeGenerator& code, size_t state_fpsr_offset);
++    // enabled == false: the cumulative exception flags are not tracked (OptimizationFlag::Unsafe_IgnoreFPSRAccumulation)
++    explicit FpsrManager(oaknut::CodeGenerator& code, size_t state_fpsr_offset, bool enabled = true);
+ 
+     void Spill();
+     void Load();
+@@ -27,6 +28,7 @@ public:
+ private:
+     oaknut::CodeGenerator& code;
+     size_t state_fpsr_offset;
++    bool enabled;
+     bool fpsr_loaded = false;
+ };
+ 
+diff --git a/src/dynarmic/backend/arm64/reg_alloc.cpp b/src/dynarmic/backend/arm64/reg_alloc.cpp
+index 90befadf..1f084575 100644
+--- a/src/dynarmic/backend/arm64/reg_alloc.cpp
++++ b/src/dynarmic/backend/arm64/reg_alloc.cpp
+@@ -10,6 +10,7 @@
+ #include <iterator>
+ 
+ #include <mcl/assert.hpp>
++#include <android/log.h>
+ #include <mcl/bit/bit_field.hpp>
+ #include <mcl/bit_cast.hpp>
+ #include <mcl/mp/metavalue/lift_value.hpp>
+@@ -227,11 +228,19 @@ void RegAlloc::UpdateAllUses() {
+ }
+ 
+ void RegAlloc::AssertAllUnlocked() const {
++    // MC4: this assert fired as a process-killing std::terminate when a
++    // corrupted guest dispatch translated a block that leaves a register
++    // locked. Log and continue instead - the block itself was already
++    // emitted; the lock is only bookkeeping.
+     const auto is_unlocked = [](const auto& i) { return !i.locked && !i.realized; };
+-    ASSERT(std::all_of(gprs.begin(), gprs.end(), is_unlocked));
+-    ASSERT(std::all_of(fprs.begin(), fprs.end(), is_unlocked));
+-    ASSERT(is_unlocked(flags));
+-    ASSERT(std::all_of(spills.begin(), spills.end(), is_unlocked));
++    const auto all_unlocked = std::all_of(gprs.begin(), gprs.end(), is_unlocked)
++        && std::all_of(fprs.begin(), fprs.end(), is_unlocked)
++        && is_unlocked(flags)
++        && std::all_of(spills.begin(), spills.end(), is_unlocked);
++    if (!all_unlocked) {
++        __android_log_print(ANDROID_LOG_ERROR, "Dynarmic",
++                            "RegAlloc: block left a register locked/realized; continuing");
++    }
+ }
+ 
+ void RegAlloc::AssertNoMoreUses() const {
+@@ -593,6 +602,14 @@ HostLocInfo& RegAlloc::ValueInfo(HostLoc host_loc) {
+     ASSERT_FALSE("RegAlloc::ValueInfo: Invalid HostLoc::Kind");
+ }
+ 
++bool RegAlloc::HasValue(const IR::Inst* value) const {
++    const auto contains_value = [value](const HostLocInfo& info) { return info.Contains(value); };
++    if (std::any_of(gprs.begin(), gprs.end(), contains_value)) return true;
++    if (std::any_of(fprs.begin(), fprs.end(), contains_value)) return true;
++    if (contains_value(flags)) return true;
++    return std::any_of(spills.begin(), spills.end(), contains_value);
++}
++
+ HostLocInfo& RegAlloc::ValueInfo(const IR::Inst* value) {
+     const auto contains_value = [value](const HostLocInfo& info) { return info.Contains(value); };
+ 
+diff --git a/src/dynarmic/backend/arm64/reg_alloc.h b/src/dynarmic/backend/arm64/reg_alloc.h
+index 96801d45..5fc39c33 100644
+--- a/src/dynarmic/backend/arm64/reg_alloc.h
++++ b/src/dynarmic/backend/arm64/reg_alloc.h
+@@ -162,6 +162,11 @@ public:
+ 
+     ArgumentInfo GetArgumentInfo(IR::Inst* inst);
+     bool WasValueDefined(IR::Inst* inst) const;
++    // Bridge (dynarmic_bridge_jit_speed.patch): the value currently lives in a vector register.
++    bool IsValueInFpr(const IR::Inst* value) const {
++        const auto location = ValueLocation(value);
++        return location && location->kind == HostLoc::Kind::Fpr;
++    }
+ 
+     auto ReadX(Argument& arg) { return RAReg<oaknut::XReg>{*this, RWType::Read, arg.value, nullptr}; }
+     auto ReadW(Argument& arg) { return RAReg<oaknut::WReg>{*this, RWType::Read, arg.value, nullptr}; }
+@@ -322,6 +327,10 @@ private:
+     std::optional<HostLoc> ValueLocation(const IR::Inst* value) const;
+     HostLocInfo& ValueInfo(HostLoc host_loc);
+     HostLocInfo& ValueInfo(const IR::Inst* value);
++    // MC4 containment: the experimental arm64 regalloc can evict a value
++    // between RAReg's ctor lock and dtor unlock, tripping ASSERT_FALSE in
++    // ValueInfo and killing the process. Callers now check HasValue first.
++    bool HasValue(const IR::Inst* value) const;
+ 
+     oaknut::CodeGenerator& code;
+     FpsrManager& fpsr_manager;
+@@ -341,14 +350,14 @@ private:
+ template<typename T>
+ RAReg<T>::RAReg(RegAlloc& reg_alloc, RWType rw, const IR::Value& read_value, const IR::Inst* write_value)
+         : reg_alloc{reg_alloc}, rw{rw}, read_value{read_value}, write_value{write_value} {
+-    if (rw != RWType::Write && !read_value.IsImmediate()) {
++    if (rw != RWType::Write && !read_value.IsImmediate() && reg_alloc.HasValue(read_value.GetInst())) {
+         reg_alloc.ValueInfo(read_value.GetInst()).locked++;
+     }
+ }
+ 
+ template<typename T>
+ RAReg<T>::~RAReg() {
+-    if (rw != RWType::Write && !read_value.IsImmediate()) {
++    if (rw != RWType::Write && !read_value.IsImmediate() && reg_alloc.HasValue(read_value.GetInst())) {
+         reg_alloc.ValueInfo(read_value.GetInst()).locked--;
+     }
+     if (reg) {
+diff --git a/src/dynarmic/backend/arm64/stack_layout.h b/src/dynarmic/backend/arm64/stack_layout.h
+index cf7f3259..450462b7 100644
+--- a/src/dynarmic/backend/arm64/stack_layout.h
++++ b/src/dynarmic/backend/arm64/stack_layout.h
+@@ -23,7 +23,8 @@ struct alignas(16) RSBEntry {
+     u64 code_ptr;
+ };
+ 
+-constexpr size_t RSBCount = 8;
++// Bridge (dynarmic_bridge_jit_speed.patch): 16 instead of 8 entries; the engine's C++ call chains are deeper than 8.
++constexpr size_t RSBCount = 16;
+ constexpr u64 RSBIndexMask = (RSBCount - 1) * sizeof(RSBEntry);
+ 
+ struct alignas(16) StackLayout {
+diff --git a/src/dynarmic/frontend/A32/decoder/asimd.inc b/src/dynarmic/frontend/A32/decoder/asimd.inc
+index d0dfd867..422e2138 100644
+--- a/src/dynarmic/frontend/A32/decoder/asimd.inc
++++ b/src/dynarmic/frontend/A32/decoder/asimd.inc
+@@ -59,7 +59,7 @@ INST(v8_SHA256SU1,          "SHA256SU1",                "111100110D10nnnndddd110
+ // Three registers of different lengths
+ INST(asimd_VADDL,           "VADDL/VADDW",              "1111001U1Dzznnnndddd000oN0M0mmmm") // ASIMD
+ INST(asimd_VSUBL,           "VSUBL/VSUBW",              "1111001U1Dzznnnndddd001oN0M0mmmm") // ASIMD
+-//INST(asimd_VADDHN,          "VADDHN",                   "111100101-----------0100-0-0----") // ASIMD
++INST(asimd_VADDHN,           "VADDHN",                  "111100101Dzznnnndddd0100N0M0mmmm") // ASIMD
+ //INST(asimd_VRADDHN,         "VRADDHN",                  "111100111-----------0100-0-0----") // ASIMD
+ INST(asimd_VABAL,           "VABAL",                    "1111001U1Dzznnnndddd0101N0M0mmmm") // ASIMD
+ //INST(asimd_VSUBHN,          "VSUBHN",                   "111100101-----------0110-0-0----") // ASIMD
+diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+index 44ac2450..2bc6787c 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
++++ b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+@@ -887,6 +887,7 @@ struct TranslatorVisitor final {
+ 
+     // Advanced SIMD three registers with different lengths
+     bool asimd_VADDL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm);
++    bool asimd_VADDHN(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+     bool asimd_VSUBL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm);
+     bool asimd_VABAL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+     bool asimd_VABDL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+diff --git a/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp b/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
+index a69f39bf..37aa6e7b 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
+@@ -905,6 +905,26 @@ bool TranslatorVisitor::asimd_VADDL(bool U, bool D, size_t sz, size_t Vn, size_t
+     });
+ }
+ 
++bool TranslatorVisitor::asimd_VADDHN(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
++    if (sz == 0b11) {
++        return DecodeError();
++    }
++
++    const size_t esize = 8U << sz;
++    const auto d = ToVector(false, Vd, D);
++    const auto m = ToVector(true, Vm, M);
++    const auto n = ToVector(true, Vn, N);
++
++    const auto reg_m = ir.GetVector(m);
++    const auto reg_n = ir.GetVector(n);
++    const auto sum = ir.VectorAdd(2 * esize, reg_n, reg_m);
++    const auto result = ir.VectorNarrow(2 * esize,
++                                        ir.VectorLogicalShiftRight(2 * esize, sum,
++                                                                   static_cast<u8>(esize)));
++    ir.SetVector(d, result);
++    return true;
++}
++
+ bool TranslatorVisitor::asimd_VSUBL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm) {
+     return WideInstruction(*this, U, D, sz, Vn, Vd, N, M, Vm, op ? WidenBehaviour::Second : WidenBehaviour::Both, [this](size_t esize, const auto&, const auto& reg_n, const auto& reg_m) {
+         return ir.VectorSub(esize, reg_n, reg_m);
+diff --git a/src/dynarmic/frontend/A32/translate/impl/vfp.cpp b/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
+index a4e37f74..47018017 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/vfp.cpp
+@@ -1185,7 +1185,11 @@ bool TranslatorVisitor::vfp_VPOP(Cond cond, bool D, size_t Vd, bool sz, Imm<8> i
+     ir.SetRegister(Reg::SP, ir.Add(address, ir.Imm32(imm32)));
+ 
+     for (size_t i = 0; i < regs; ++i) {
+-        if (sz) {
++        if (sz && !ir.current_location.EFlag()) {
++            // Bridge (dynarmic_bridge_jit_speed.patch): little-endian, one 64-bit access per D register.
++            ir.SetExtendedRegister(d + i, ir.ReadMemory64(address, IR::AccType::ATOMIC));
++            address = ir.Add(address, ir.Imm32(8));
++        } else if (sz) {
+             auto lo = ir.ReadMemory32(address, IR::AccType::ATOMIC);
+             address = ir.Add(address, ir.Imm32(4));
+             auto hi = ir.ReadMemory32(address, IR::AccType::ATOMIC);
+@@ -1226,7 +1230,11 @@ bool TranslatorVisitor::vfp_VPUSH(Cond cond, bool D, size_t Vd, bool sz, Imm<8>
+     ir.SetRegister(Reg::SP, address);
+ 
+     for (size_t i = 0; i < regs; ++i) {
+-        if (sz) {
++        if (sz && !ir.current_location.EFlag()) {
++            // Bridge (dynarmic_bridge_jit_speed.patch): little-endian, one 64-bit access per D register.
++            ir.WriteMemory64(address, ir.GetExtendedRegister(d + i), IR::AccType::ATOMIC);
++            address = ir.Add(address, ir.Imm32(8));
++        } else if (sz) {
+             const auto reg_d = ir.GetExtendedRegister(d + i);
+             auto lo = ir.LeastSignificantWord(reg_d);
+             auto hi = ir.MostSignificantWord(reg_d).result;
+@@ -1257,7 +1265,9 @@ bool TranslatorVisitor::vfp_VLDR(Cond cond, bool U, bool D, Reg n, size_t Vd, bo
+     const auto base = n == Reg::PC ? ir.Imm32(ir.AlignPC(4)) : ir.GetRegister(n);
+     const auto address = U ? ir.Add(base, ir.Imm32(imm32)) : ir.Sub(base, ir.Imm32(imm32));
+ 
+-    if (sz) {
++    if (sz && !ir.current_location.EFlag()) {
++        ir.SetExtendedRegister(d, ir.ReadMemory64(address, IR::AccType::ATOMIC));
++    } else if (sz) {
+         auto lo = ir.ReadMemory32(address, IR::AccType::ATOMIC);
+         auto hi = ir.ReadMemory32(ir.Add(address, ir.Imm32(4)), IR::AccType::ATOMIC);
+         if (ir.current_location.EFlag()) {
+@@ -1282,7 +1292,9 @@ bool TranslatorVisitor::vfp_VSTR(Cond cond, bool U, bool D, Reg n, size_t Vd, bo
+     const auto d = ToExtReg(sz, Vd, D);
+     const auto base = n == Reg::PC ? ir.Imm32(ir.AlignPC(4)) : ir.GetRegister(n);
+     const auto address = U ? ir.Add(base, ir.Imm32(imm32)) : ir.Sub(base, ir.Imm32(imm32));
+-    if (sz) {
++    if (sz && !ir.current_location.EFlag()) {
++        ir.WriteMemory64(address, ir.GetExtendedRegister(d), IR::AccType::ATOMIC);
++    } else if (sz) {
+         const auto reg_d = ir.GetExtendedRegister(d);
+         auto lo = ir.LeastSignificantWord(reg_d);
+         auto hi = ir.MostSignificantWord(reg_d).result;
+@@ -1334,6 +1346,11 @@ bool TranslatorVisitor::vfp_VSTM_a1(Cond cond, bool p, bool u, bool D, bool w, R
+     }
+     for (size_t i = 0; i < regs; i++) {
+         const auto value = ir.GetExtendedRegister(d + i);
++        if (!ir.current_location.EFlag()) {
++            ir.WriteMemory64(address, value, IR::AccType::ATOMIC);
++            address = ir.Add(address, ir.Imm32(8));
++            continue;
++        }
+         auto word1 = ir.LeastSignificantWord(value);
+         auto word2 = ir.MostSignificantWord(value).result;
+ 
+@@ -1428,6 +1445,11 @@ bool TranslatorVisitor::vfp_VLDM_a1(Cond cond, bool p, bool u, bool D, bool w, R
+         ir.SetRegister(n, u ? IR::U32(ir.Add(address, ir.Imm32(imm32))) : address);
+     }
+     for (size_t i = 0; i < regs; i++) {
++        if (!ir.current_location.EFlag()) {
++            ir.SetExtendedRegister(d + i, ir.ReadMemory64(address, IR::AccType::ATOMIC));
++            address = ir.Add(address, ir.Imm32(8));
++            continue;
++        }
+         auto word1 = ir.ReadMemory32(address, IR::AccType::ATOMIC);
+         address = ir.Add(address, ir.Imm32(4));
+         auto word2 = ir.ReadMemory32(address, IR::AccType::ATOMIC);
+diff --git a/src/dynarmic/frontend/A32/translate/translate_arm.cpp b/src/dynarmic/frontend/A32/translate/translate_arm.cpp
+index 24b5797d..d0ba2f9d 100644
+--- a/src/dynarmic/frontend/A32/translate/translate_arm.cpp
++++ b/src/dynarmic/frontend/A32/translate/translate_arm.cpp
+@@ -26,6 +26,12 @@ IR::Block TranslateArm(LocationDescriptor descriptor, TranslateCallbacks* tcb, c
+     TranslatorVisitor visitor{block, descriptor, options};
+ 
+     bool should_continue = true;
++    // MC4 bridge patch: cap block size. A data-as-code NOP slide (guest
++    // jumped into a non-executable region) translates billions of identical
++    // instructions into ONE IR block, freezing the host in pool-slab
++    // allocations. Terminate oversized blocks; the dispatcher re-enters at
++    // the next instruction.
++    u32 mc4_block_instructions = 0;
+     do {
+         const u32 arm_pc = visitor.ir.current_location.PC();
+         u64 ticks_for_instruction = 1;
+@@ -62,14 +68,27 @@ IR::Block TranslateArm(LocationDescriptor descriptor, TranslateCallbacks* tcb, c
+ 
+         visitor.ir.current_location = visitor.ir.current_location.AdvancePC(4);
+         block.CycleCount() += ticks_for_instruction;
++        if (++mc4_block_instructions >= 2048 && !single_step) {
++            // W513 (bridge run692): same fix as the thumb side -- a long
++            // Trailing-state ARM run already has a terminal; forcing
++            // ReturnToDispatch here double-sets and asserts.
++            if (CondCanContinue(visitor.cond_state, visitor.ir)) {
++                visitor.ir.SetTerm(IR::Term::ReturnToDispatch());
++                break;
++            }
++        }
+     } while (should_continue && CondCanContinue(visitor.cond_state, visitor.ir) && !single_step);
+ 
+     if (visitor.cond_state == ConditionalState::Translating || visitor.cond_state == ConditionalState::Trailing || single_step) {
+         if (should_continue) {
+-            if (single_step) {
+-                visitor.ir.SetTerm(IR::Term::LinkBlock{visitor.ir.current_location});
+-            } else {
+-                visitor.ir.SetTerm(IR::Term::LinkBlockFast{visitor.ir.current_location});
++            // W514: a Trailing-state run may already carry a terminal from the
++            // branch visitor; re-setting here asserts. Keep the existing one.
++            if (!block.HasTerminal()) {
++                if (single_step) {
++                    visitor.ir.SetTerm(IR::Term::LinkBlock{visitor.ir.current_location});
++                } else {
++                    visitor.ir.SetTerm(IR::Term::LinkBlockFast{visitor.ir.current_location});
++                }
+             }
+         }
+     }
+diff --git a/src/dynarmic/frontend/A32/translate/translate_thumb.cpp b/src/dynarmic/frontend/A32/translate/translate_thumb.cpp
+index d61d8ccb..1162f3b8 100644
+--- a/src/dynarmic/frontend/A32/translate/translate_thumb.cpp
++++ b/src/dynarmic/frontend/A32/translate/translate_thumb.cpp
+@@ -107,6 +107,12 @@ IR::Block TranslateThumb(LocationDescriptor descriptor, TranslateCallbacks* tcb,
+     TranslatorVisitor visitor{block, descriptor, options};
+ 
+     bool should_continue = true;
++    // MC4 bridge patch: cap block size. A data-as-code NOP slide (guest
++    // jumped into a non-executable region) translates billions of identical
++    // instructions into ONE IR block, freezing the host in pool-slab
++    // allocations. Terminate oversized blocks; the dispatcher re-enters at
++    // the next instruction.
++    u32 mc4_block_instructions = 0;
+     do {
+         const u32 arm_pc = visitor.ir.current_location.PC();
+         u64 ticks_for_instruction = 1;
+@@ -161,14 +167,26 @@ IR::Block TranslateThumb(LocationDescriptor descriptor, TranslateCallbacks* tcb,
+ 
+         visitor.ir.current_location = visitor.ir.current_location.AdvancePC(static_cast<int>(visitor.current_instruction_size)).AdvanceIT();
+         block.CycleCount() += ticks_for_instruction;
++        if (++mc4_block_instructions >= 2048 && !single_step) {
++            // W494 (bridge run664): a long Trailing-state thumb run already has a
++            // terminal; forcing ReturnToDispatch here double-sets and asserts.
++            if (CondCanContinue(visitor.cond_state, visitor.ir)) {
++                visitor.ir.SetTerm(IR::Term::ReturnToDispatch());
++                break;
++            }
++        }
+     } while (should_continue && CondCanContinue(visitor.cond_state, visitor.ir) && !single_step);
+ 
+     if (visitor.cond_state == ConditionalState::Translating || visitor.cond_state == ConditionalState::Trailing || single_step) {
+         if (should_continue) {
+-            if (single_step) {
+-                visitor.ir.SetTerm(IR::Term::LinkBlock{visitor.ir.current_location});
+-            } else {
+-                visitor.ir.SetTerm(IR::Term::LinkBlockFast{visitor.ir.current_location});
++            // W514: a Trailing-state run may already carry a terminal from the
++            // branch visitor; re-setting here asserts. Keep the existing one.
++            if (!block.HasTerminal()) {
++                if (single_step) {
++                    visitor.ir.SetTerm(IR::Term::LinkBlock{visitor.ir.current_location});
++                } else {
++                    visitor.ir.SetTerm(IR::Term::LinkBlockFast{visitor.ir.current_location});
++                }
+             }
+         }
+     }
+diff --git a/src/dynarmic/interface/A32/a32.h b/src/dynarmic/interface/A32/a32.h
+index e1c5b40f..d426243c 100644
+--- a/src/dynarmic/interface/A32/a32.h
++++ b/src/dynarmic/interface/A32/a32.h
+@@ -47,6 +47,28 @@ public:
+      */
+     void InvalidateCacheRange(std::uint32_t start_address, std::size_t length);
+ 
++    /**
++     * Bridge JIT warm-up: translates the blocks named by recorded IR location descriptors before they run.
++     * Stops while more than min_remaining_bytes of code cache are still free. Returns the number translated
++     * (or found already translated). Cannot be called from a callback.
++     */
++    std::size_t PrecompileBlocks(const std::uint64_t* descriptors, std::size_t count, std::size_t min_remaining_bytes);
++
++    /**
++     * Bridge sampling profiler: the guest code a host pc of this JIT's code cache belongs to.
++     * Returns 0 if the pc is not in the code cache, 1 for an emitted block (guest_pc = the block's first
++     * instruction, thumb = its Thumb state) and 2 for the prelude (dispatcher, memory and callback trampolines).
++     * Only from the thread that runs this JIT, while it is not executing.
++     */
++    int ReverseLookup(const void* host_pc, std::uint32_t* guest_pc, bool* thumb);
++
++    /**
++     * Bridge profiling: the IR location descriptor of the block a host pc belongs to (ReverseLookup kind 1), and the
++     * host code emitted for a descriptor. Same thread rules as ReverseLookup.
++     */
++    bool ReverseLookupDescriptor(const void* host_pc, std::uint64_t* descriptor);
++    bool BlockCode(std::uint64_t descriptor, const void** code, std::size_t* size);
++
+     /**
+      * Reset CPU state to state at startup. Does not clear code cache.
+      * Cannot be called from a callback.
+diff --git a/src/dynarmic/interface/exclusive_monitor.h b/src/dynarmic/interface/exclusive_monitor.h
+index 48136758..0b721854 100644
+--- a/src/dynarmic/interface/exclusive_monitor.h
++++ b/src/dynarmic/interface/exclusive_monitor.h
+@@ -67,6 +67,11 @@ public:
+     /// Unmark processor id
+     void ClearProcessor(size_t processor_id);
+ 
++    /// Bridge (dynarmic_patches/dynarmic_compile_stats.patch): exclusive stores only scan the
++    /// reservations of processors [0, limit) (default: all). The host hands out processor ids from 0
++    /// upwards and sets the limit above every id in use before that processor runs.
++    void SetScanLimit(size_t limit);
++
+ private:
+     bool CheckAndClear(size_t processor_id, VAddr address);
+ 
+@@ -82,6 +87,7 @@ private:
+     static constexpr VAddr INVALID_EXCLUSIVE_ADDRESS = 0xDEAD'DEAD'DEAD'DEADull;
+     SpinLock lock;
+     std::vector<VAddr> exclusive_addresses;
++    size_t scan_limit;
+     std::vector<Vector> exclusive_values;
+ };
+ 
+diff --git a/src/dynarmic/interface/optimization_flags.h b/src/dynarmic/interface/optimization_flags.h
+index 2f65f0bf..1856a1d9 100644
+--- a/src/dynarmic/interface/optimization_flags.h
++++ b/src/dynarmic/interface/optimization_flags.h
+@@ -49,6 +49,12 @@ enum class OptimizationFlag : std::uint32_t {
+     /// result in unexpected behaviour in multithreaded scenarios, including but not limited
+     /// to data races and deadlocks.
+     Unsafe_IgnoreGlobalMonitor = 0x00100000,
++    /// Bridge (dynarmic_patches/dynarmic_bridge_jit_speed.patch): an UNSAFE optimization that stops accumulating the
++    /// cumulative floating-point exception flags (FPSCR IOC/DZC/OFC/UFC/IXC/IDC, QC) of the guest. The arm64 backend
++    /// otherwise clears the host FPSR before floating-point work and folds it into the guest state before every memory
++    /// access, a pair of system-register accesses around almost every floating-point instruction. The flags then read
++    /// back as last written by the guest (VMSR). Only for guests that never test them.
++    Unsafe_IgnoreFPSRAccumulation = 0x00200000,
+ };
+ 
+ constexpr OptimizationFlag no_optimizations = static_cast<OptimizationFlag>(0);
